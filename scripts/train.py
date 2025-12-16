@@ -37,6 +37,7 @@ from training import VLAMetrics, get_train_strategy
 from conf import VLAConfig, VLARegistry
 from vla import load, load_vla
 from vla import CogACT
+from vla_modules.utils import postset_model
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -49,6 +50,14 @@ overwatch = initialize_overwatch(__name__)
 @dataclass
 class TrainConfig:
     # fmt: off
+    disentangle: str = "none"
+    with_memory: bool = False
+    static_ratio: float = 0.0
+    invswap_ratio: float = 1.0
+    use_contrastive: bool = False
+    backward_window_size: int = 10
+
+    lora_rank: int = 0
 
     # VLAConfig (`conf/vla.py`); override with --vla.type `VLARegistry.<VLA>.vla_id`
     vla: VLAConfig = field(
@@ -185,6 +194,8 @@ def train(cfg: TrainConfig) -> None:
                             )
         # del this variable to avoid bugs. The vlm shouldn't be used anymore
         del vlm
+    # if "disentangle_method" not in vla.vlm.config:
+    postset_model(vla.vlm, cfg)
 
     # [Validate] Model should be in Full Precision!
     for param in vla.parameters():
@@ -213,6 +224,20 @@ def train(cfg: TrainConfig) -> None:
     overwatch.info(f"Invoking `VLM.freeze_backbones()` for `{vla_id}` => Stage: `{stage}`")
     vla.freeze_backbones(stage)
 
+    if cfg.lora_rank > 0:
+        overwatch.info(f"Applying LoRA with rank {cfg.lora_rank} to LLM Backbone")
+        from peft import LoraConfig, get_peft_model
+        peft_config = LoraConfig(
+            task_type="none", #TaskType.CAUSAL_LM,
+            target_modules=['qkv', 'fc1', 'fc2', 'q_proj', 'k_proj', 'v_proj', 'o_proj', 'up_proj', 'down_proj', 'gate_proj'], # modify here for different LLM architectures
+            modules_to_save=['vlm.projector'], # make sure projector is saved
+            r=cfg.lora_rank,
+            lora_alpha=32,
+            lora_dropout=0.1,
+        )
+
+        vla.vlm = get_peft_model(vla.vlm, peft_config)
+
     # Print number of total/trainable model parameters
     num_params = sum(p.numel() for p in vla.parameters())
     num_trainable_params = sum(p.numel() for p in vla.parameters() if p.requires_grad)
@@ -233,6 +258,7 @@ def train(cfg: TrainConfig) -> None:
         load_all_data_for_training=cfg.load_all_data_for_training,
         future_action_window_size=cfg.future_action_window_size,
         past_action_window_size=cfg.past_action_window_size,
+        backward_observation_window_size=cfg.backward_window_size,
     )
 
     # Save dataset statistics for de-normalization at inference time

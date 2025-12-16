@@ -246,6 +246,7 @@ class VLAMetrics:
             "loss": deque(maxlen=window_size),
             "step_time": deque(maxlen=window_size),
             "lr": [],
+            "nce_loss": deque(maxlen=window_size),
         }
 
         # Created metrics buffers for individual tracked datasets
@@ -310,6 +311,7 @@ class VLAMetrics:
         loss = torch.stack(list(self.state["loss"])).mean().item()
         step_time, lr = np.mean(list(self.state["step_time"])), self.state["lr"][-1]
         status = self.get_status(loss)
+        nce_loss = torch.stack(list(self.state["nce_loss"])).mean().item() if len(self.state["nce_loss"]) > 0 else 0.0
 
 
         # Fire to Trackers
@@ -323,6 +325,7 @@ class VLAMetrics:
                 f"{prefix}/Loss (Raw)": loss_raw,
                 f"{prefix}/Learning Rate": lr,
                 f"{prefix}/Step Time": step_time,
+                f"{prefix}/NCE Loss": nce_loss,
             },
         )
         return status

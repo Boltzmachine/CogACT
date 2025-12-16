@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Optional, Union
 
 from huggingface_hub import HfFileSystem, hf_hub_download
+import torch
 
 from prismatic.conf import ModelConfig
 from prismatic.models.materialize import get_llm_backbone_and_tokenizer, get_vision_backbone_and_transform
@@ -19,6 +20,7 @@ from prismatic.models.vlms import PrismaticVLM
 from prismatic.overwatch import initialize_overwatch
 
 from vla import CogACT
+from vla_modules.utils import postset_model
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
@@ -126,13 +128,19 @@ def load_vla(
 ) -> CogACT:
     """Loads a pretrained CogACT from either local disk or the HuggingFace Hub."""
 
+    use_lora = False
+    if model_id_or_path.endswith(".peft"):
+        use_lora = True
+        peft_path = model_id_or_path
+        model_id_or_path = "CogACT/CogACT-Base"  # temporary hack to load the base model first
+
     # TODO (siddk, moojink) :: Unify semantics with `load()` above; right now, `load_vla()` assumes path points to
     #   checkpoint `.pt` file, rather than the top-level run directory!
     if os.path.isfile(model_id_or_path):
         overwatch.info(f"Loading from local checkpoint path `{(checkpoint_pt := Path(model_id_or_path))}`")
 
         # [Validate] Checkpoint Path should look like `.../<RUN_ID>/checkpoints/<CHECKPOINT_PATH>.pt`
-        assert (checkpoint_pt.suffix == ".pt") and (checkpoint_pt.parent.name == "checkpoints"), "Invalid checkpoint!"
+        assert (checkpoint_pt.suffix == ".peft" or (checkpoint_pt.suffix == ".pt")) and (checkpoint_pt.parent.name == "checkpoints"), "Invalid checkpoint!"
         run_dir = checkpoint_pt.parents[1]
 
         # Get paths for `config.json`, `dataset_statistics.json` and pretrained checkpoint
@@ -166,10 +174,18 @@ def load_vla(
                 repo_id=model_id_or_path, filename=f"{(Path('checkpoints') / target_ckpt)!s}", cache_dir=cache_dir
             )
 
-    # Load VLA Config (and corresponding base VLM `ModelConfig`) from `config.json`
-    with open(config_json, "r") as f:
-        vla_cfg = json.load(f)["vla"]
-        model_cfg = ModelConfig.get_choice_class(vla_cfg["base_vlm"])()
+
+    if use_lora:
+        with open(Path(peft_path).parents[1] / "config.json", "r") as f:
+            training_cfg = json.load(f)
+            vla_cfg = training_cfg["vla"]
+            model_cfg = ModelConfig.get_choice_class(vla_cfg["base_vlm"])()
+    else:
+        # Load VLA Config (and corresponding base VLM `ModelConfig`) from `config.json`
+        with open(config_json, "r") as f:
+            training_cfg = json.load(f)
+            vla_cfg = training_cfg["vla"]
+            model_cfg = ModelConfig.get_choice_class(vla_cfg["base_vlm"])()
 
     # Load Dataset Statistics for Action Denormalization
     with open(dataset_statistics_json, "r") as f:
@@ -214,5 +230,23 @@ def load_vla(
         norm_stats=norm_stats,
         **kwargs,
     )
+
+    if use_lora:
+        peft_state_dict = torch.load(peft_path, map_location="cpu")['model']
+        from peft import LoraConfig, get_peft_model
+        peft_config = LoraConfig(
+            task_type="none", #TaskType.CAUSAL_LM,
+            target_modules=['qkv', 'fc1', 'fc2', 'q_proj', 'k_proj', 'v_proj', 'o_proj', 'up_proj', 'down_proj', 'gate_proj'], # modify here for different LLM architectures
+            modules_to_save=['vlm.projector'], # make sure projector is saved
+            r=32,
+            lora_alpha=32,
+            lora_dropout=0.1,
+        )
+        vla.vlm = get_peft_model(vla.vlm, peft_config)
+        vla.load_state_dict(peft_state_dict, strict=True)
+        vla.vlm = vla.vlm.merge_and_unload()
+
+    if "disentangle" in training_cfg:
+        postset_model(vla.vlm, training_cfg)
 
     return vla

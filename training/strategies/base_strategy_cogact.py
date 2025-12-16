@@ -9,6 +9,7 @@ heavy lifting.
 """
 import torch  
 import torchvision.transforms.functional as TF
+import torch.nn.functional as F
 import torch.distributed as dist
 import numpy as np  
 
@@ -29,6 +30,12 @@ from prismatic.util.batching_utils import SplitModalitySampler
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction, PaddedCollatorForLanguageModeling
 
 from vla import CogACT
+
+def maybe_unwrap_model(model):
+    """If model is wrapped in DDP or FSDP, unwrap it to get the original model."""
+    if isinstance(model, (torch.nn.parallel.DistributedDataParallel, torch.distributed.fsdp.FullyShardedDataParallel)):
+        return model.module
+    return model
   
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -44,7 +51,8 @@ def update_ema(ema_model, model, decay=0.9999):
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
-
+def vector_normalize(*xs):
+    return [None if x is None else F.normalize(x, dim=-1) for x in xs]
 # === Abstract Base Class for an arbitrary Training Strategy ===
 class TrainingStrategy(ABC):
     def __init__(
@@ -271,7 +279,7 @@ class TrainingStrategy(ABC):
             num_workers=0,
             worker_init_fn=self.worker_init_fn,
         )
-
+        use_contrastive = True
         # === Train ===
         status = metrics.get_status()
         with tqdm(
@@ -283,7 +291,7 @@ class TrainingStrategy(ABC):
             self.vlm.train()
 
             # Zero Gradients (just in case)
-            if self.vlm.use_ema is not None and self.vlm.use_ema == True:
+            if self.vlm.module.use_ema is not None and self.vlm.module.use_ema == True:
                 self.vlm.ema_diffusion.eval()
             self.optimizer.zero_grad()
 
@@ -297,7 +305,7 @@ class TrainingStrategy(ABC):
                     "cuda", dtype=self.mixed_precision_dtype, enabled=self.enable_mixed_precision_training
                 ):
                     if action_model:
-                        loss, output = self.vlm(
+                        vlm_outputs = self.vlm(
                             input_ids=batch["input_ids"],
                             attention_mask=batch["attention_mask"],
                             actions=batch["actions"],
@@ -305,19 +313,40 @@ class TrainingStrategy(ABC):
                             action_masks=batch["action_masks"],
                             labels=batch["labels"],
                             output_hidden_states = True,
+                            other_pixel_values = batch.get("other_pixel_values", None),
                         )
+                        if len(vlm_outputs) == 3:
+                            loss, output, (static, other_static) = vlm_outputs
+                        else:
+                            loss, output = vlm_outputs
                     else:
+                        raise NotImplementedError
                         # [Contract] self.vlm.forward() must automatically compute `loss` and return!
                         output: CausalLMOutputWithPast = self.vlm(
                             input_ids=batch["input_ids"],
                             attention_mask=batch["attention_mask"],
                             pixel_values=batch["pixel_values"],
                             labels=batch["labels"],
+                            other_pixel_values = batch.get("other_pixel_values", None),
                         )
                         loss = output.loss
 
+                logs = {"loss": loss}
+                    
+                if use_contrastive:
+                    static_features, other_static_features = map(lambda x: x.transpose(0, 1), vector_normalize(static['features'], other_static['features'])) # (N, B, F)
+                    positive_logits = (static_features * other_static_features).sum(-1) # (N, B)
+                    pair_logits = static_features @ static_features.transpose(1, 2) #(N, B, B)
+                    pair_logits.diagonal(dim1=1, dim2=2).copy_(positive_logits) # (N, B, B)
+                    nce_loss = F.cross_entropy(
+                        pair_logits.reshape(-1, pair_logits.size(-1)), # (N*B, B)
+                        torch.arange(pair_logits.size(-1), device=pair_logits.device).repeat(pair_logits.size(0)), # (N*B)
+                    )
+                    logs['nce_loss'] = nce_loss
+                    loss = loss + 0.1 * nce_loss
+
                 # Commit Loss =>> Backward!
-                metrics.commit(loss=loss)
+                metrics.commit(**logs)
                 
                 normalized_loss = loss / self.grad_accumulation_steps
                 normalized_loss.backward()

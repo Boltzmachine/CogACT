@@ -11,11 +11,12 @@ import torch
 
 from prismatic.models.vlms import PrismaticVLM
 from vla import CogACT
-from training.strategies import FSDPStrategy, TrainingStrategy
+from training.strategies import FSDPStrategy, TrainingStrategy, DDPStrategy
 # Registry =>> Maps ID --> {cls(), kwargs} :: supports FSDP for now, but DDP handler is also implemented!
 TRAIN_STRATEGIES = {
     "fsdp-shard-grad-op": {"cls": FSDPStrategy, "kwargs": {"sharding_strategy": "shard-grad-op"}},
     "fsdp-full-shard": {"cls": FSDPStrategy, "kwargs": {"sharding_strategy": "full-shard"}},
+    "ddp": {"cls": DDPStrategy, "kwargs": {}},
 }
 
 

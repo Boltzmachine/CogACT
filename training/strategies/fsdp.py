@@ -35,6 +35,7 @@ from prismatic.overwatch import initialize_overwatch
 
 from vla import CogACT
 from training.strategies.base_strategy_cogact import TrainingStrategy
+from peft import PeftModel
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
@@ -123,20 +124,26 @@ class FSDPStrategy(TrainingStrategy):
             # Save on rank zero *only*
             if overwatch.is_rank_zero():
                 checkpoint_dir = run_dir / "checkpoints"
-                if train_loss is None:
-                    checkpoint_path = checkpoint_dir / f"step-{global_step:06d}-epoch-{epoch:02d}-loss=inf.pt"
-                else:
-                    checkpoint_path = (
-                        checkpoint_dir / f"step-{global_step:06d}-epoch-{epoch:02d}-loss={train_loss:.4f}.pt"
-                    )
+                checkpoint_path = checkpoint_dir / f"step-{global_step:06d}-epoch-{epoch:02d}.pt"
                 
-                for key in list(model_state_dicts.keys()):
-                    if key.startswith("vlm."):
-                        value = model_state_dicts.pop(key)
-                        model_state_dicts[key[4:]] = value
+                # if train_loss is None:
+                #     checkpoint_path = checkpoint_dir / f"step-{global_step:06d}-epoch-{epoch:02d}-loss=inf.pt"
+                # else:
+                #     checkpoint_path = (
+                #         checkpoint_dir / f"step-{global_step:06d}-epoch-{epoch:02d}-loss={train_loss:.4f}.pt"
+                #     )
+                if isinstance(self.vlm.module, PeftModel):
+                    torch.save({"model": full_vlm_state_dict}, str(checkpoint_path) + ".peft")
+                elif isinstance(self.vlm.module.vlm, PeftModel):
+                    torch.save({"model": full_vlm_state_dict}, str(checkpoint_path) + ".peft")
+                else:
+                    for key in list(model_state_dicts.keys()):
+                        if key.startswith("vlm."):
+                            value = model_state_dicts.pop(key)
+                            model_state_dicts[key[4:]] = value
 
-                # Save Checkpoint & Copy Latest to `latest-checkpoint.pt`
-                torch.save({"model": model_state_dicts}, checkpoint_path)
+                    # Save Checkpoint & Copy Latest to `latest-checkpoint.pt`
+                    torch.save({"model": model_state_dicts}, checkpoint_path)
             dist.barrier()
             optim_state_dict = FSDP.optim_state_dict(self.vlm, self.optimizer)
             if overwatch.is_rank_zero():

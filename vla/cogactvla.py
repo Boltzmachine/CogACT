@@ -12,13 +12,14 @@ from copy import deepcopy
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from torch.distributed.fsdp.wrap import _module_wrap_policy, _or_policy
 from torch.nn.utils.rnn import pad_sequence
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import LlamaTokenizerFast
-
+from peft import PeftModel
 from prismatic.models.backbones.llm import LLMBackbone
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import VisionBackbone
@@ -109,10 +110,29 @@ class CogACT(nn.Module):
         return_dict: Optional[bool] = None,
         repeated_diffusion_steps: int = 4,
         action_masks = None,
+        other_pixel_values: Optional[torch.FloatTensor] = None,
+        cache = None,
     ) -> Tuple:
         """Run a forward pass through the VLM, returning a CausalLMOutputWithPast instance (contains loss)."""
-        
-        output: CausalLMOutputWithPast = self.vlm(
+        if isinstance(self.vlm, PeftModel):
+            with torch.no_grad():
+                with self.vlm.disable_adapter():
+                    ref_output = self.vlm(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
+                        labels=labels,
+                        inputs_embeds=inputs_embeds,
+                        past_key_values=past_key_values,
+                        use_cache=use_cache,
+                        output_attentions=output_attentions,
+                        output_hidden_states=output_hidden_states,
+                        return_dict=return_dict,
+                        other_pixel_values=other_pixel_values,
+                    )
+                    ref_last_hidden = ref_output[0].hidden_states[-1].detach()
+
+        output = self.vlm(
             input_ids=input_ids,
             attention_mask=attention_mask,
             pixel_values=pixel_values,
@@ -123,8 +143,11 @@ class CogACT(nn.Module):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            other_pixel_values=other_pixel_values,
         )
-
+        if hasattr(output, 'statics'):
+            static, other_static = output.statics
+        
         # extract the last hidden state and the learnable EOS token feature
         last_hidden = output.hidden_states[-1]
 
@@ -138,22 +161,28 @@ class CogACT(nn.Module):
         
         last_hidden = last_hidden[:, num_patch :]
 
-        # extract the cognition feature
-        cumulative_sum = attention_mask.cumsum(dim=1)
-        last_true_indices = (cumulative_sum == cumulative_sum.max(dim=1, keepdim=True)[0]).float().argmax(dim=1)  
-        expanded_indices = last_true_indices.unsqueeze(-1).expand(-1, last_hidden.size(-1))  
-        cognition_features = last_hidden.gather(1, expanded_indices.unsqueeze(1))  # [B, 1, D]
+        if 'ref_last_hidden' in locals():
+            ref_last_hidden = ref_last_hidden[:, num_patch :]
+            loss = F.l1_loss(last_hidden, ref_last_hidden)
+        else:
+            # extract the cognition feature
+            cumulative_sum = attention_mask.cumsum(dim=1)
+            last_true_indices = (cumulative_sum == cumulative_sum.max(dim=1, keepdim=True)[0]).float().argmax(dim=1)  
+            expanded_indices = last_true_indices.unsqueeze(-1).expand(-1, last_hidden.size(-1))  
+            cognition_features = last_hidden.gather(1, expanded_indices.unsqueeze(1))  # [B, 1, D]
 
-        actions_history = actions[:,0:self.past_action_window_size,:]
-        actions_future = actions[:, -(self.future_action_window_size+1):, :]
-        
-        # Repeat 'actions' 'repeated_diffusion_steps' times, resulting in [repeated_diffusion_steps*B, T, D]
-        actions_repeated = actions_future.repeat(repeated_diffusion_steps, 1, 1)
-        actions_history_repeated = actions_history.repeat(repeated_diffusion_steps, 1, 1)
-        cognition_features_repeated = cognition_features.repeat(repeated_diffusion_steps, 1, 1) # [repeated_diffusion_steps*B, 1, D]
+            actions_history = actions[:,0:self.past_action_window_size,:]
+            actions_future = actions[:, -(self.future_action_window_size+1):, :]
+            
+            # Repeat 'actions' 'repeated_diffusion_steps' times, resulting in [repeated_diffusion_steps*B, T, D]
+            actions_repeated = actions_future.repeat(repeated_diffusion_steps, 1, 1)
+            actions_history_repeated = actions_history.repeat(repeated_diffusion_steps, 1, 1)
+            cognition_features_repeated = cognition_features.repeat(repeated_diffusion_steps, 1, 1) # [repeated_diffusion_steps*B, 1, D]
 
-        # Action model forward and compute loss
-        loss = self.action_model.loss(actions_repeated, cognition_features_repeated)
+            # Action model forward and compute loss
+            loss = self.action_model.loss(actions_repeated, cognition_features_repeated)
+        if 'other_static' in locals():
+            return loss, output, (static, other_static)
         return loss, output
 
     def get_fsdp_wrapping_policy(self) -> Callable:
@@ -302,8 +331,22 @@ class CogACT(nn.Module):
         else:
             raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
         
+        if (history_image:= kwargs.pop('history_image', None)) is not None:
+            history_pixel_values = image_transform(history_image)
+            if isinstance(history_pixel_values, torch.Tensor):
+                history_pixel_values = history_pixel_values[None, ...].to(self.vlm.device)
+            elif isinstance(history_pixel_values, dict):
+                history_pixel_values = {k: v[None, ...].to(self.vlm.device) for k, v in history_pixel_values.items()}
+            else:
+                raise ValueError(f"Unsupported `history_pixel_values` type = {type(history_pixel_values)}")
+            kwargs['other_pixel_values'] = history_pixel_values
+        
         # Invoke super().generate --> taps into `GenerationMixin` which (redirects) to `forward()`
         autocast_dtype = self.vlm.llm_backbone.half_precision_dtype
+
+        if 'cache' in kwargs:
+            kwargs['past_key_values'] = kwargs.pop('cache')
+            # kwargs['past_key_values'] = None #FIXME
 
         # Generate cognition feature through vlm
         with torch.autocast("cuda", dtype=autocast_dtype, enabled=self.vlm.enable_mixed_precision_training):
@@ -384,7 +427,12 @@ class CogACT(nn.Module):
             normalized_actions,
         )
 
-        return actions, normalized_actions
+        past_key_values = tuple(
+            (k_cache[:, :, :self.vlm.n_static_tokens, :], v_cache[:, :, :self.vlm.n_static_tokens, :])
+            for k_cache, v_cache in output.past_key_values
+        )
+
+        return actions, normalized_actions, past_key_values
 
     @torch.inference_mode()
     def predict_action_batch(
