@@ -75,6 +75,12 @@ class CogACT(nn.Module):
         # Diffusion head is always trainable
         self._trainable_module_keys = ['action_model']
         self.norm_stats = norm_stats
+        if kwargs.get("use_cache_gate", False):
+            self.patch_cache_gate()
+
+    def patch_cache_gate(self):
+        from vla_modules import CacheGate, CacheGateImage, CacheGateSimple
+        self.cache_gate = CacheGateImage(4096)
 
     @property
     def trainable_module_keys(self) -> List[str]:
@@ -111,6 +117,7 @@ class CogACT(nn.Module):
         repeated_diffusion_steps: int = 4,
         action_masks = None,
         other_pixel_values: Optional[torch.FloatTensor] = None,
+        timestep: Optional[torch.LongTensor] = None,
         cache = None,
     ) -> Tuple:
         """Run a forward pass through the VLM, returning a CausalLMOutputWithPast instance (contains loss)."""
@@ -130,7 +137,7 @@ class CogACT(nn.Module):
                         return_dict=return_dict,
                         other_pixel_values=other_pixel_values,
                     )
-                    ref_last_hidden = ref_output[0].hidden_states[-1].detach()
+                    ref_last_hidden = ref_output.hidden_states[-1].detach()
 
         output = self.vlm(
             input_ids=input_ids,
@@ -144,9 +151,9 @@ class CogACT(nn.Module):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             other_pixel_values=other_pixel_values,
+            timestep=timestep,
+            cache_gate=self.cache_gate if hasattr(self, 'cache_gate') else None,
         )
-        if hasattr(output, 'statics'):
-            static, other_static = output.statics
         
         # extract the last hidden state and the learnable EOS token feature
         last_hidden = output.hidden_states[-1]
@@ -181,8 +188,15 @@ class CogACT(nn.Module):
 
             # Action model forward and compute loss
             loss = self.action_model.loss(actions_repeated, cognition_features_repeated)
-        if 'other_static' in locals():
-            return loss, output, (static, other_static)
+        if hasattr(output, 'static') or hasattr(output, 'gate'):
+            def collect_attr(attr_names):
+                info = {}
+                for attr_name in attr_names:
+                    if hasattr(output, attr_name):
+                        info[attr_name] = getattr(output, attr_name)
+                return info
+            info = collect_attr(['statics', 'gate', 'gate_logits'])
+            return loss, output, info
         return loss, output
 
     def get_fsdp_wrapping_policy(self) -> Callable:
@@ -230,6 +244,7 @@ class CogACT(nn.Module):
         action_model_type: str = 'DiT-B',
         use_ema: bool = False,
         norm_stats = None,
+        use_cache_gate: bool = False,
         **kwargs,
     ) -> CogACT:
 
@@ -268,6 +283,7 @@ class CogACT(nn.Module):
                         action_model_type = action_model_type,
                         use_ema = use_ema,
                         norm_stats = norm_stats,
+                        use_cache_gate = use_cache_gate
                         )
 
         # Load ActionModel from Checkpoint
@@ -357,6 +373,7 @@ class CogACT(nn.Module):
                 max_new_tokens=1,
                 output_hidden_states=True, 
                 return_dict_in_generate=True,
+                cache_gate=getattr(self, "cache_gate", None),
                 **kwargs
             )
             # fmt: on

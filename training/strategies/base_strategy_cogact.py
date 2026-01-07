@@ -312,11 +312,13 @@ class TrainingStrategy(ABC):
                             pixel_values=batch["pixel_values"],
                             action_masks=batch["action_masks"],
                             labels=batch["labels"],
-                            output_hidden_states = True,
-                            other_pixel_values = batch.get("other_pixel_values", None),
+                            output_hidden_states=True,
+                            other_pixel_values=batch.get("other_pixel_values", None),
+                            timestep=batch["timestep"],
                         )
+
                         if len(vlm_outputs) == 3:
-                            loss, output, (static, other_static) = vlm_outputs
+                            loss, output, info = vlm_outputs
                         else:
                             loss, output = vlm_outputs
                     else:
@@ -334,6 +336,7 @@ class TrainingStrategy(ABC):
                 logs = {"loss": loss}
                     
                 if use_contrastive:
+                    static, other_static = info['statics']
                     static_features, other_static_features = map(lambda x: x.transpose(0, 1), vector_normalize(static['features'], other_static['features'])) # (N, B, F)
                     positive_logits = (static_features * other_static_features).sum(-1) # (N, B)
                     pair_logits = static_features @ static_features.transpose(1, 2) #(N, B, B)
@@ -344,6 +347,22 @@ class TrainingStrategy(ABC):
                     )
                     logs['nce_loss'] = nce_loss
                     loss = loss + 0.1 * nce_loss
+
+                    if 'gate' in info:
+                        gate = info['gate']
+                        gate_logits = info['gate_logits']
+                        timestep = batch['timestep'].to(loss.device)
+                        time_delta = timestep[:, 1] - timestep[:, 0]  # (B,)
+                        gt_prob = torch.exp(-time_delta.float() / 10)  # (B,)
+                        gt_prob = torch.stack([gt_prob, 1 - gt_prob], dim=-1)  # (B, 2)
+                        log_gate_prob = gate_logits.log_softmax(-1)
+                        prob_reg_loss = - (gt_prob * log_gate_prob).sum(-1).mean()
+                        logs['prob_reg_loss'] = prob_reg_loss.detach()
+                        loss = loss + 0.1 * prob_reg_loss
+
+                        z_loss = torch.log(torch.exp(gate_logits).sum(-1)).pow(2).mean()
+                        logs['z_loss'] = z_loss.detach()
+                        loss = loss + 0.0001 * max(z_loss, 0.0)
 
                 # Commit Loss =>> Backward!
                 metrics.commit(**logs)

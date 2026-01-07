@@ -56,6 +56,7 @@ class TrainConfig:
     invswap_ratio: float = 1.0
     use_contrastive: bool = False
     backward_window_size: int = 10
+    use_cache_gate: bool = False
 
     lora_rank: int = 0
 
@@ -178,6 +179,7 @@ def train(cfg: TrainConfig) -> None:
                         future_action_window_size=cfg.future_action_window_size,
                         past_action_window_size=cfg.past_action_window_size,
                         use_ema=cfg.use_ema,
+                        use_cache_gate=cfg.use_cache_gate
                         )
 
     else:
@@ -191,6 +193,7 @@ def train(cfg: TrainConfig) -> None:
                             future_action_window_size=cfg.future_action_window_size,
                             past_action_window_size=cfg.past_action_window_size,
                             use_ema=cfg.use_ema,
+                            use_cache_gate=cfg.use_cache_gate
                             )
         # del this variable to avoid bugs. The vlm shouldn't be used anymore
         del vlm
@@ -230,12 +233,11 @@ def train(cfg: TrainConfig) -> None:
         peft_config = LoraConfig(
             task_type="none", #TaskType.CAUSAL_LM,
             target_modules=['qkv', 'fc1', 'fc2', 'q_proj', 'k_proj', 'v_proj', 'o_proj', 'up_proj', 'down_proj', 'gate_proj'], # modify here for different LLM architectures
-            modules_to_save=['vlm.projector'], # make sure projector is saved
+            modules_to_save=['vlm.projector', 'cache_gate'], # make sure projector is saved
             r=cfg.lora_rank,
             lora_alpha=32,
             lora_dropout=0.1,
         )
-
         vla.vlm = get_peft_model(vla.vlm, peft_config)
 
     # Print number of total/trainable model parameters

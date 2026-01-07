@@ -230,6 +230,9 @@ def load_vla(
         norm_stats=norm_stats,
         **kwargs,
     )
+    # training_cfg['use_cache_gate'] = False
+    if "disentangle" in training_cfg:
+        postset_model(vla.vlm, training_cfg)
 
     if use_lora:
         peft_state_dict = torch.load(peft_path, map_location="cpu")['model']
@@ -243,10 +246,15 @@ def load_vla(
             lora_dropout=0.1,
         )
         vla.vlm = get_peft_model(vla.vlm, peft_config)
-        vla.load_state_dict(peft_state_dict, strict=True)
+        missing_keys, unexpected_keys = vla.load_state_dict(peft_state_dict, strict=False)
+        for missing_key in missing_keys:
+            assert 'cache_gate' in missing_key, f"Missing key when loading LoRA weights: {missing_key}"
+        for unexpected_key in unexpected_keys:
+            assert 'cache_gate' in unexpected_key, f"Unexpected key when loading LoRA weights: {unexpected_key}"
+        cache_gate_state_dict = {key.replace('cache_gate.', ''): peft_state_dict[key] for key in unexpected_keys if 'cache_gate' in key}
+        if len(cache_gate_state_dict) > 0 and getattr(vla.vlm.config, "use_cache_gate", False):
+            vla.patch_cache_gate()
+            vla.cache_gate.load_state_dict(cache_gate_state_dict)
         vla.vlm = vla.vlm.merge_and_unload()
-
-    if "disentangle" in training_cfg:
-        postset_model(vla.vlm, training_cfg)
 
     return vla
