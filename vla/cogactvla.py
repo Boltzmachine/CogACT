@@ -76,11 +76,11 @@ class CogACT(nn.Module):
         self._trainable_module_keys = ['action_model']
         self.norm_stats = norm_stats
         if kwargs.get("use_cache_gate", False):
-            self.patch_cache_gate()
+            self.patch_cache_gate(kwargs.get("static_ratio", None))
 
-    def patch_cache_gate(self):
+    def patch_cache_gate(self, static_ratio):
         from vla_modules import CacheGate, CacheGateImage, CacheGateSimple
-        self.cache_gate = CacheGateImage(4096)
+        self.cache_gate = CacheGateImage(4096, static_ratio)
 
     @property
     def trainable_module_keys(self) -> List[str]:
@@ -135,7 +135,7 @@ class CogACT(nn.Module):
                         output_attentions=output_attentions,
                         output_hidden_states=output_hidden_states,
                         return_dict=return_dict,
-                        other_pixel_values=other_pixel_values,
+                        # other_pixel_values=other_pixel_values,
                     )
                     ref_last_hidden = ref_output.hidden_states[-1].detach()
 
@@ -245,6 +245,7 @@ class CogACT(nn.Module):
         use_ema: bool = False,
         norm_stats = None,
         use_cache_gate: bool = False,
+        static_ratio = None,
         **kwargs,
     ) -> CogACT:
 
@@ -283,7 +284,8 @@ class CogACT(nn.Module):
                         action_model_type = action_model_type,
                         use_ema = use_ema,
                         norm_stats = norm_stats,
-                        use_cache_gate = use_cache_gate
+                        use_cache_gate = use_cache_gate,
+                        static_ratio = static_ratio,
                         )
 
         # Load ActionModel from Checkpoint
@@ -444,10 +446,10 @@ class CogACT(nn.Module):
             normalized_actions,
         )
 
-        past_key_values = tuple(
-            (k_cache[:, :, :self.vlm.n_static_tokens, :], v_cache[:, :, :self.vlm.n_static_tokens, :])
-            for k_cache, v_cache in output.past_key_values
-        )
+        if output.past_key_values is not None:
+            past_key_values = self.vlm.truncate_cache(output.past_key_values)
+        else:
+            past_key_values = None
 
         return actions, normalized_actions, past_key_values
 

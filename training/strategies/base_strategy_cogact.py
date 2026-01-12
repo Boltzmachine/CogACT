@@ -337,30 +337,55 @@ class TrainingStrategy(ABC):
                     
                 if use_contrastive:
                     static, other_static = info['statics']
-                    static_features, other_static_features = map(lambda x: x.transpose(0, 1), vector_normalize(static['features'], other_static['features'])) # (N, B, F)
-                    positive_logits = (static_features * other_static_features).sum(-1) # (N, B)
-                    pair_logits = static_features @ static_features.transpose(1, 2) #(N, B, B)
-                    pair_logits.diagonal(dim1=1, dim2=2).copy_(positive_logits) # (N, B, B)
-                    nce_loss = F.cross_entropy(
-                        pair_logits.reshape(-1, pair_logits.size(-1)), # (N*B, B)
-                        torch.arange(pair_logits.size(-1), device=pair_logits.device).repeat(pair_logits.size(0)), # (N*B)
-                    )
+                    def get_nce_loss(features1, features2):
+                        static_features, other_static_features = map(lambda x: x.transpose(0, 1), vector_normalize(features1, features2)) # (N, B, F)
+                        positive_logits = (static_features * other_static_features).sum(-1) # (N, B)
+                        pair_logits = static_features @ static_features.transpose(1, 2) #(N, B, B)
+                        pair_logits.diagonal(dim1=1, dim2=2).copy_(positive_logits) # (N, B, B)
+                        nce_loss = F.cross_entropy(
+                            pair_logits.reshape(-1, pair_logits.size(-1)), # (N*B, B)
+                            torch.arange(pair_logits.size(-1), device=pair_logits.device).repeat(pair_logits.size(0)), # (N*B)
+                        )
+                        return nce_loss
+                    
+                    if isinstance(static, list) or isinstance(static, tuple):
+                        nce_loss = 0.0
+                        for _other_static in other_static:
+                            for cs, os in zip(static, _other_static):
+                                nce_loss += get_nce_loss(cs['features'], os['features']) / len(other_static) / len(os)
+                    else:
+                        nce_loss = get_nce_loss(static['features'], other_static['features'])
                     logs['nce_loss'] = nce_loss
                     loss = loss + 0.1 * nce_loss
 
                     if 'gate' in info:
-                        gate = info['gate']
-                        gate_logits = info['gate_logits']
                         timestep = batch['timestep'].to(loss.device)
-                        time_delta = timestep[:, 1] - timestep[:, 0]  # (B,)
-                        gt_prob = torch.exp(-time_delta.float() / 10)  # (B,)
-                        gt_prob = torch.stack([gt_prob, 1 - gt_prob], dim=-1)  # (B, 2)
-                        log_gate_prob = gate_logits.log_softmax(-1)
-                        prob_reg_loss = - (gt_prob * log_gate_prob).sum(-1).mean()
+                        if isinstance(static, list) or isinstance(static, tuple):
+                            prob_reg_loss = 0.0
+                            for i in range(len(other_static)):
+                                time_delta = timestep[:, -1] - timestep[:, i]  # (B,)
+                                gt_prob = torch.exp(-time_delta.float() / 10)  # (B,)
+                                gt_prob = torch.stack([gt_prob, 1 - gt_prob], dim=-1)  # (B, 2)
+                                gate_logits = info['gate_logits'][i]
+                                log_gate_prob = gate_logits.log_softmax(-1)
+                                prob_reg_loss += - (gt_prob * log_gate_prob).sum(-1).mean() / len(other_static)
+                        else:
+                            time_delta = timestep[:, 1] - timestep[:, 0]  # (B,)
+                            gt_prob = torch.exp(-time_delta.float() / 10)  # (B,)
+                            gt_prob = torch.stack([gt_prob, 1 - gt_prob], dim=-1)  # (B, 2)
+                            gate_logits = info['gate_logits']
+                            log_gate_prob = gate_logits.log_softmax(-1)
+                            prob_reg_loss = - (gt_prob * log_gate_prob).sum(-1).mean()
                         logs['prob_reg_loss'] = prob_reg_loss.detach()
                         loss = loss + 0.1 * prob_reg_loss
 
-                        z_loss = torch.log(torch.exp(gate_logits).sum(-1)).pow(2).mean()
+                        if isinstance(static, list) or isinstance(static, tuple):
+                            z_loss = 0.0
+                            for i in range(len(other_static)):
+                                gate_logits = info['gate_logits'][i].to(loss.dtype)
+                                z_loss += torch.log(torch.exp(gate_logits).sum(-1)).pow(2).mean() / len(other_static)
+                        else:
+                            z_loss = torch.log(torch.exp(info['gate_logits']).sum(-1)).pow(2).mean()
                         logs['z_loss'] = z_loss.detach()
                         loss = loss + 0.0001 * max(z_loss, 0.0)
 

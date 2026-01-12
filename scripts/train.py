@@ -20,7 +20,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
 
 import draccus
 import torch
@@ -52,10 +52,10 @@ class TrainConfig:
     # fmt: off
     disentangle: str = "none"
     with_memory: bool = False
-    static_ratio: float = 0.0
+    static_ratio: Union[float, List[float]] = 0.0
     invswap_ratio: float = 1.0
     use_contrastive: bool = False
-    backward_window_size: int = 10
+    backward_window_size: Union[int, List[int]] = 10
     use_cache_gate: bool = False
 
     lora_rank: int = 0
@@ -179,7 +179,8 @@ def train(cfg: TrainConfig) -> None:
                         future_action_window_size=cfg.future_action_window_size,
                         past_action_window_size=cfg.past_action_window_size,
                         use_ema=cfg.use_ema,
-                        use_cache_gate=cfg.use_cache_gate
+                        use_cache_gate=cfg.use_cache_gate,
+                        static_ratio=cfg.static_ratio,
                         )
 
     else:

@@ -253,7 +253,7 @@ def load_vla(
             assert 'cache_gate' in unexpected_key, f"Unexpected key when loading LoRA weights: {unexpected_key}"
         cache_gate_state_dict = {key.replace('cache_gate.', ''): peft_state_dict[key] for key in unexpected_keys if 'cache_gate' in key}
         if len(cache_gate_state_dict) > 0 and getattr(vla.vlm.config, "use_cache_gate", False):
-            vla.patch_cache_gate()
+            vla.patch_cache_gate(static_ratio=vla.vlm.config.static_ratio)
             vla.cache_gate.load_state_dict(cache_gate_state_dict)
         vla.vlm = vla.vlm.merge_and_unload()
 
