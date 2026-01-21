@@ -238,6 +238,7 @@ def train(cfg: TrainConfig) -> None:
             r=cfg.lora_rank,
             lora_alpha=32,
             lora_dropout=0.1,
+            init_lora_weights="gaussian",
         )
         vla.vlm = get_peft_model(vla.vlm, peft_config)
 

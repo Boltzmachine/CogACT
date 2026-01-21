@@ -279,7 +279,7 @@ class TrainingStrategy(ABC):
             num_workers=0,
             worker_init_fn=self.worker_init_fn,
         )
-        use_contrastive = True
+        static_reg = 'nce'
         # === Train ===
         status = metrics.get_status()
         with tqdm(
@@ -335,17 +335,25 @@ class TrainingStrategy(ABC):
 
                 logs = {"loss": loss}
                     
-                if use_contrastive:
+                if static_reg is not None:
                     static, other_static = info['statics']
                     def get_nce_loss(features1, features2):
                         static_features, other_static_features = map(lambda x: x.transpose(0, 1), vector_normalize(features1, features2)) # (N, B, F)
                         positive_logits = (static_features * other_static_features).sum(-1) # (N, B)
                         pair_logits = static_features @ static_features.transpose(1, 2) #(N, B, B)
-                        pair_logits.diagonal(dim1=1, dim2=2).copy_(positive_logits) # (N, B, B)
-                        nce_loss = F.cross_entropy(
-                            pair_logits.reshape(-1, pair_logits.size(-1)), # (N*B, B)
-                            torch.arange(pair_logits.size(-1), device=pair_logits.device).repeat(pair_logits.size(0)), # (N*B)
-                        )
+
+                        if static_reg == 'nce':
+                            pair_logits.diagonal(dim1=1, dim2=2).copy_(positive_logits) # (N, B, B) 
+                            nce_loss = F.cross_entropy(
+                                pair_logits.reshape(-1, pair_logits.size(-1)), # (N*B, B)
+                                torch.arange(pair_logits.size(-1), device=pair_logits.device).repeat(pair_logits.size(0)), # (N*B)
+                            )
+                        elif static_reg == 'bt':
+                            pair_logits.diagonal(dim1=1, dim2=2).fill_(0)
+                            off_diag = pair_logits.pow(2).mean()
+                            on_diag = (positive_logits - 1).pow(2).mean()
+                            nce_loss = on_diag + off_diag
+
                         return nce_loss
                     
                     if isinstance(static, list) or isinstance(static, tuple):
@@ -355,6 +363,7 @@ class TrainingStrategy(ABC):
                                 nce_loss += get_nce_loss(cs['features'], os['features']) / len(other_static) / len(os)
                     else:
                         nce_loss = get_nce_loss(static['features'], other_static['features'])
+
                     logs['nce_loss'] = nce_loss
                     loss = loss + 0.1 * nce_loss
 

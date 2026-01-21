@@ -31,6 +31,9 @@ from prismatic.util.nn_utils import FusedMLPProjector, LinearProjector, MLPProje
 from action_model.action_model import ActionModel
 from action_model.models import DiT
 
+from peft.tuners.tuners_utils import BaseTunerLayer
+from peft.utils.other import ModulesToSaveWrapper
+
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
@@ -121,23 +124,6 @@ class CogACT(nn.Module):
         cache = None,
     ) -> Tuple:
         """Run a forward pass through the VLM, returning a CausalLMOutputWithPast instance (contains loss)."""
-        if isinstance(self.vlm, PeftModel):
-            with torch.no_grad():
-                with self.vlm.disable_adapter():
-                    ref_output = self.vlm(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        pixel_values=pixel_values,
-                        labels=labels,
-                        inputs_embeds=inputs_embeds,
-                        past_key_values=past_key_values,
-                        use_cache=use_cache,
-                        output_attentions=output_attentions,
-                        output_hidden_states=output_hidden_states,
-                        return_dict=return_dict,
-                        # other_pixel_values=other_pixel_values,
-                    )
-                    ref_last_hidden = ref_output.hidden_states[-1].detach()
 
         output = self.vlm(
             input_ids=input_ids,
@@ -154,6 +140,29 @@ class CogACT(nn.Module):
             timestep=timestep,
             cache_gate=self.cache_gate if hasattr(self, 'cache_gate') else None,
         )
+        
+        if isinstance(self.vlm, PeftModel):
+            with torch.no_grad():
+                for module in self.vlm.modules():
+                    if isinstance(module, (BaseTunerLayer, ModulesToSaveWrapper)):
+                        module._disable_adapters = True
+                ref_output = self.vlm(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    pixel_values=pixel_values,
+                    labels=labels,
+                    inputs_embeds=inputs_embeds,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                    # other_pixel_values=other_pixel_values,
+                )
+                ref_last_hidden = ref_output.hidden_states[-1].detach()
+                for module in self.vlm.modules():
+                    if isinstance(module, (BaseTunerLayer, ModulesToSaveWrapper)):
+                        module._disable_adapters = False
         
         # extract the last hidden state and the learnable EOS token feature
         last_hidden = output.hidden_states[-1]
