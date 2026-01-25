@@ -359,13 +359,13 @@ class TrainingStrategy(ABC):
                     if isinstance(static, list) or isinstance(static, tuple):
                         nce_loss = 0.0
                         for _other_static in other_static:
-                            for cs, os in zip(static, _other_static):
-                                nce_loss += get_nce_loss(cs['features'], os['features']) / len(other_static) / len(os)
+                            for i, (cs, os) in enumerate(zip(static, _other_static)):
+                                nce_loss += [2, 1][i] * get_nce_loss(cs['features'], os['features']) / len(other_static) / len(os)
                     else:
                         nce_loss = get_nce_loss(static['features'], other_static['features'])
 
                     logs['nce_loss'] = nce_loss
-                    loss = loss + 0.1 * nce_loss
+                    # loss = loss + 0.1 * nce_loss
 
                     if 'gate' in info:
                         timestep = batch['timestep'].to(loss.device)
