@@ -24,7 +24,7 @@ from prismatic.models.backbones.llm import LLMBackbone
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import VisionBackbone
 from prismatic.models.vlms.base_vlm import VLM
-from prismatic.models.vlms.prismatic import PrismaticVLM
+from prismatic.models.vlms.prismatic import PrismaticVLM, PrismaticVLMFlash, PrismaticVLMTTF
 from prismatic.overwatch import initialize_overwatch
 from prismatic.util.nn_utils import FusedMLPProjector, LinearProjector, MLPProjector
 
@@ -246,11 +246,17 @@ class CogACT(nn.Module):
         norm_stats = None,
         use_cache_gate: bool = False,
         static_ratio = None,
+        baseline = None,
         **kwargs,
     ) -> CogACT:
-
+        if baseline is None:
+            vlm_cls = PrismaticVLM
+        elif baseline == "flashvla":
+            vlm_cls = PrismaticVLMFlash
+        elif baseline == "ttf":
+            vlm_cls = PrismaticVLMTTF
         # Load VLM backbone, borrowed from PrismaticVLM
-        vlm = PrismaticVLM(
+        vlm = vlm_cls(
             model_id,
             vision_backbone,
             llm_backbone,
@@ -651,3 +657,341 @@ class CogACT(nn.Module):
         """Dimensionality of the policy's action space."""
         unnorm_key = self._check_unnorm_key(self.norm_stats, unnorm_key)
         return self.norm_stats[unnorm_key]["action"]
+
+
+    @torch.inference_mode()
+    def predict_action_flash(
+        self, image: Image, 
+        instruction: str, 
+        unnorm_key: Optional[str] = None, 
+        cfg_scale: float = 1.5, 
+        use_ddim: bool = False,
+        num_ddim_steps: int = 5,
+        **kwargs: str
+    ) -> np.ndarray:
+        """
+        Core function for VLA inference; maps input image and task instruction to continuous action.
+
+        @param image: PIL Image as [height, width, 3]
+        @param instruction: Task instruction string
+        @param unnorm_key: Optional dataset name for retrieving un-normalizing statistics; if None, checks that model
+                           was trained only on a single dataset, and retrieves those statistics.
+        @param cfg_scale: Scaling factor for classifier-free guidance (CFG); if == 1.0, CFG is disabled.
+        @param use_ddim: Use DDIM sampling instead of DDPM sampling.
+        @param num_ddim_steps: Number of DDIM steps to use for sampling.
+
+        @return Unnormalized (continuous) action vector --> end-effector deltas.
+        """
+        image_transform, tokenizer = self.vlm.vision_backbone.image_transform, self.vlm.llm_backbone.tokenizer
+
+        # Build VLA Prompt
+        prompt_builder = self.vlm.get_prompt_builder()
+        prompt_builder.add_turn(role="human", message=f"What action should the robot take to {instruction.lower()}?")
+        prompt_text = prompt_builder.get_prompt()
+        # Prepare Inputs
+        input_ids = tokenizer(prompt_text, truncation=True, return_tensors="pt").input_ids.to(self.vlm.device)
+        if isinstance(tokenizer, LlamaTokenizerFast):
+            # Note: We need to add this special empty token ('') after the colon (':') token in "ASSISTANT:"
+            #       insert it to match the inputs seen at training time. The empty token is at index 29871.
+            #       We also need to add the special cognition token at index 2 (i.e. the EOS token).
+            input_ids = torch.cat(
+                (input_ids, torch.unsqueeze(torch.Tensor([29871, 2]).long(), dim=0).to(self.vlm.device)), dim=1
+            )
+        else:
+            raise ValueError(f"Unsupported `tokenizer` type = {type(tokenizer)}")
+
+        # Preprocess Image
+        pixel_values = image_transform(image)
+        if isinstance(pixel_values, torch.Tensor):
+            pixel_values = pixel_values[None, ...].to(self.vlm.device)
+        elif isinstance(pixel_values, dict):
+            pixel_values = {k: v[None, ...].to(self.vlm.device) for k, v in pixel_values.items()}
+        else:
+            raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
+        
+        if (history_image:= kwargs.pop('history_image', None)) is not None:
+            history_pixel_values = image_transform(history_image)
+            if isinstance(history_pixel_values, torch.Tensor):
+                history_pixel_values = history_pixel_values[None, ...].to(self.vlm.device)
+            elif isinstance(history_pixel_values, dict):
+                history_pixel_values = {k: v[None, ...].to(self.vlm.device) for k, v in history_pixel_values.items()}
+            else:
+                raise ValueError(f"Unsupported `history_pixel_values` type = {type(history_pixel_values)}")
+            kwargs['other_pixel_values'] = history_pixel_values
+        
+        # Invoke super().generate --> taps into `GenerationMixin` which (redirects) to `forward()`
+        autocast_dtype = self.vlm.llm_backbone.half_precision_dtype
+
+        if 'cache' in kwargs:
+            kwargs['past_key_values'] = kwargs.pop('cache')
+            # kwargs['past_key_values'] = None #FIXME
+        # Generate cognition feature through vlm
+        with torch.autocast("cuda", dtype=autocast_dtype, enabled=self.vlm.enable_mixed_precision_training):
+            # fmt: off
+            output = super(PrismaticVLM, self.vlm).generate(
+                input_ids=input_ids,                            # Shape: [1, seq]
+                pixel_values=pixel_values,                      # Shape: [1, 3, res, res] or Dict[str, ...]
+                max_new_tokens=1,
+                output_hidden_states=True, 
+                return_dict_in_generate=True,
+                **kwargs
+            )
+            # fmt: on
+
+        # Extract cognition feature
+        cognition_features = output.hidden_states[0][-1][:,-1,:]
+        assert (cognition_features.shape[0], cognition_features.shape[1]) == (1,4096), "Batch size must be 1 for action prediction"
+        using_cfg = cfg_scale > 1.0
+
+        model_dtype = next(self.action_model.net.parameters()).dtype
+        B = cognition_features.shape[0]
+
+        cognition_features = cognition_features.unsqueeze(1).to(model_dtype)  # [B, 1, D]
+
+        # Sample random noise
+        noise = torch.randn(B, self.future_action_window_size+1, self.action_model.in_channels, device=cognition_features.device).to(model_dtype)  #[B, T, D]
+    
+        # Setup classifier-free guidance:
+        if using_cfg:
+            noise = torch.cat([noise, noise], 0)
+            uncondition = self.action_model.net.z_embedder.uncondition
+            uncondition = uncondition.unsqueeze(0)  #[1, D]
+            uncondition = uncondition.expand(B, 1, -1) #[B, 1, D]
+            z = torch.cat([cognition_features, uncondition], 0)
+            cfg_scale = cfg_scale
+            model_kwargs = dict(z=z, cfg_scale=cfg_scale)
+            sample_fn = self.action_model.net.forward_with_cfg
+        else:
+            model_kwargs = dict(z=cognition_features)
+            sample_fn = self.action_model.net.forward
+
+        # DDIM Sampling
+        if use_ddim and num_ddim_steps is not None:
+            if self.action_model.ddim_diffusion is None:
+                self.action_model.create_ddim(ddim_step=num_ddim_steps)
+            samples = self.action_model.ddim_diffusion.ddim_sample_loop(sample_fn, 
+                                                                noise.shape, 
+                                                                noise, 
+                                                                clip_denoised=False,
+                                                                model_kwargs=model_kwargs,
+                                                                progress=False,
+                                                                device=cognition_features.device,
+                                                                eta=0.0
+                                                                )
+        else:
+            # DDPM Sampling
+            samples = self.action_model.diffusion.p_sample_loop(sample_fn, 
+                                                                    noise.shape, 
+                                                                    noise, 
+                                                                    clip_denoised=False,
+                                                                    model_kwargs=model_kwargs,
+                                                                    progress=False,
+                                                                    device=cognition_features.device
+                                                                    )
+        if using_cfg:
+            samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+        normalized_actions = samples[0].cpu().numpy()
+
+        # Un-normalize Actions        
+        action_norm_stats = self.get_action_stats(unnorm_key)
+        mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
+        action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
+        normalized_actions = np.clip(normalized_actions, -1, 1)
+        normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1) 
+        actions = np.where(
+            mask,
+            0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
+            normalized_actions,
+        )
+        past_key_values = None
+
+        return actions, normalized_actions, past_key_values
+
+
+    @torch.inference_mode()
+    def predict_action_ttf(
+        self, image: Image, 
+        instruction: str, 
+        unnorm_key: Optional[str] = None, 
+        cfg_scale: float = 1.5, 
+        use_ddim: bool = False,
+        num_ddim_steps: int = 5,
+        **kwargs: str
+    ) -> np.ndarray:
+        """
+        Core function for VLA inference; maps input image and task instruction to continuous action.
+
+        @param image: PIL Image as [height, width, 3]
+        @param instruction: Task instruction string
+        @param unnorm_key: Optional dataset name for retrieving un-normalizing statistics; if None, checks that model
+                           was trained only on a single dataset, and retrieves those statistics.
+        @param cfg_scale: Scaling factor for classifier-free guidance (CFG); if == 1.0, CFG is disabled.
+        @param use_ddim: Use DDIM sampling instead of DDPM sampling.
+        @param num_ddim_steps: Number of DDIM steps to use for sampling.
+
+        @return Unnormalized (continuous) action vector --> end-effector deltas.
+        """
+        image_transform, tokenizer = self.vlm.vision_backbone.image_transform, self.vlm.llm_backbone.tokenizer
+
+        # Build VLA Prompt
+        prompt_builder = self.vlm.get_prompt_builder()
+        prompt_builder.add_turn(role="human", message=f"What action should the robot take to {instruction.lower()}?")
+        prompt_text = prompt_builder.get_prompt()
+        # Prepare Inputs
+        input_ids = tokenizer(prompt_text, truncation=True, return_tensors="pt").input_ids.to(self.vlm.device)
+        if isinstance(tokenizer, LlamaTokenizerFast):
+            # Note: We need to add this special empty token ('') after the colon (':') token in "ASSISTANT:"
+            #       insert it to match the inputs seen at training time. The empty token is at index 29871.
+            #       We also need to add the special cognition token at index 2 (i.e. the EOS token).
+            input_ids = torch.cat(
+                (input_ids, torch.unsqueeze(torch.Tensor([29871, 2]).long(), dim=0).to(self.vlm.device)), dim=1
+            )
+        else:
+            raise ValueError(f"Unsupported `tokenizer` type = {type(tokenizer)}")
+
+        # Preprocess Image
+        pixel_values = image_transform(image)
+        if isinstance(pixel_values, torch.Tensor):
+            pixel_values = pixel_values[None, ...].to(self.vlm.device)
+        elif isinstance(pixel_values, dict):
+            pixel_values = {k: v[None, ...].to(self.vlm.device) for k, v in pixel_values.items()}
+        else:
+            raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
+        
+        if (history_image:= kwargs.pop('history_image', None)) is not None:
+            history_pixel_values = image_transform(history_image)
+            if isinstance(history_pixel_values, torch.Tensor):
+                history_pixel_values = history_pixel_values[None, ...].to(self.vlm.device)
+            elif isinstance(history_pixel_values, dict):
+                history_pixel_values = {k: v[None, ...].to(self.vlm.device) for k, v in history_pixel_values.items()}
+            else:
+                raise ValueError(f"Unsupported `history_pixel_values` type = {type(history_pixel_values)}")
+            kwargs['other_pixel_values'] = history_pixel_values
+        
+        # Invoke super().generate --> taps into `GenerationMixin` which (redirects) to `forward()`
+        autocast_dtype = self.vlm.llm_backbone.half_precision_dtype
+
+        if 'cache' in kwargs:
+            kwargs['past_key_values'] = kwargs.pop('cache')
+            # kwargs['past_key_values'] = None #FIXME
+        # Generate cognition feature through vlm
+        self.manager.input_ids_len = input_ids.shape[1]
+        with torch.autocast("cuda", dtype=autocast_dtype, enabled=self.vlm.enable_mixed_precision_training):
+            # fmt: off
+            output = super(PrismaticVLM, self.vlm).generate(
+                input_ids=input_ids,                            # Shape: [1, seq]
+                pixel_values=pixel_values,                      # Shape: [1, 3, res, res] or Dict[str, ...]
+                max_new_tokens=1,
+                output_hidden_states=True, 
+                return_dict_in_generate=True,
+                output_attentions=True,
+                **kwargs
+            )
+            # fmt: on
+        generated_ids = output.sequences
+        attentions = output.attentions
+        
+        # Store attention weights for attention-guided fusion
+        # Analyze all 7 action tokens' attention patterns
+        if attentions and len(attentions) > 0:
+            # print(f"  DEBUG: attentions length: {len(attentions)}")
+            # print(f"  DEBUG: first step type: {type(attentions[0])}")
+            
+            # attentions is a tuple of tuples: (step1_layers, step2_layers, ...)
+            # Each step contains attention from all layers
+            
+            # Extract attention weights from all 7 action tokens
+            # all_step_attentions = []
+            
+            # for step_idx, step_attention in enumerate(attentions):
+            #     if isinstance(step_attention, (tuple, list)):
+            #         print(f"  DEBUG: step {step_idx} has {len(step_attention)} layers")
+                    
+            #         # Try different layers to find the right format
+            #         for layer_idx in [15, -1, 0]:  # Try layer 15 (VLA-Cache), last layer, first layer
+            #             layer_idx = layer_idx if layer_idx >= 0 else len(step_attention) + layer_idx
+            #             if 0 <= layer_idx < len(step_attention):
+            #                 candidate_attention = step_attention[layer_idx]
+            #                 print(f"  DEBUG: step {step_idx} layer {layer_idx} shape: {candidate_attention.shape}")
+                            
+            #                 # Look for 4D attention tensor [batch, heads, seq, seq]
+            #                 if candidate_attention.dim() == 4 and candidate_attention.shape[2] >= 257:
+            #                     all_step_attentions.append(candidate_attention)
+            #                     print(f"  DEBUG: stored step {step_idx} layer {layer_idx} attention")
+            #                     break
+            #         else:
+            #             print(f"  DEBUG: no valid attention found in step {step_idx}")
+            #     else:
+            #         print(f"  DEBUG: step {step_idx} is not tuple/list: {type(step_attention)}")
+            
+            # Store VLA-Cache style attention: attentions[0] (first step's all layers)
+            self.manager.last_attention_layers = attentions[0]  
+            # print(f"  DEBUG: stored VLA-Cache attention layers: {len(attentions[0])} layers")
+        # Extract cognition feature
+        cognition_features = output.hidden_states[0][-1][:,-1,:]
+        assert (cognition_features.shape[0], cognition_features.shape[1]) == (1,4096), "Batch size must be 1 for action prediction"
+        using_cfg = cfg_scale > 1.0
+
+        model_dtype = next(self.action_model.net.parameters()).dtype
+        B = cognition_features.shape[0]
+
+        cognition_features = cognition_features.unsqueeze(1).to(model_dtype)  # [B, 1, D]
+
+        # Sample random noise
+        noise = torch.randn(B, self.future_action_window_size+1, self.action_model.in_channels, device=cognition_features.device).to(model_dtype)  #[B, T, D]
+    
+        # Setup classifier-free guidance:
+        if using_cfg:
+            noise = torch.cat([noise, noise], 0)
+            uncondition = self.action_model.net.z_embedder.uncondition
+            uncondition = uncondition.unsqueeze(0)  #[1, D]
+            uncondition = uncondition.expand(B, 1, -1) #[B, 1, D]
+            z = torch.cat([cognition_features, uncondition], 0)
+            cfg_scale = cfg_scale
+            model_kwargs = dict(z=z, cfg_scale=cfg_scale)
+            sample_fn = self.action_model.net.forward_with_cfg
+        else:
+            model_kwargs = dict(z=cognition_features)
+            sample_fn = self.action_model.net.forward
+
+        # DDIM Sampling
+        if use_ddim and num_ddim_steps is not None:
+            if self.action_model.ddim_diffusion is None:
+                self.action_model.create_ddim(ddim_step=num_ddim_steps)
+            samples = self.action_model.ddim_diffusion.ddim_sample_loop(sample_fn, 
+                                                                noise.shape, 
+                                                                noise, 
+                                                                clip_denoised=False,
+                                                                model_kwargs=model_kwargs,
+                                                                progress=False,
+                                                                device=cognition_features.device,
+                                                                eta=0.0
+                                                                )
+        else:
+            # DDPM Sampling
+            samples = self.action_model.diffusion.p_sample_loop(sample_fn, 
+                                                                    noise.shape, 
+                                                                    noise, 
+                                                                    clip_denoised=False,
+                                                                    model_kwargs=model_kwargs,
+                                                                    progress=False,
+                                                                    device=cognition_features.device
+                                                                    )
+        if using_cfg:
+            samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+        normalized_actions = samples[0].cpu().numpy()
+
+        # Un-normalize Actions        
+        action_norm_stats = self.get_action_stats(unnorm_key)
+        mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
+        action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
+        normalized_actions = np.clip(normalized_actions, -1, 1)
+        normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1) 
+        actions = np.where(
+            mask,
+            0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
+            normalized_actions,
+        )
+        past_key_values = None
+
+        return actions, normalized_actions, past_key_values

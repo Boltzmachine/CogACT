@@ -16,7 +16,7 @@ import torch
 from prismatic.conf import ModelConfig
 from prismatic.models.materialize import get_llm_backbone_and_tokenizer, get_vision_backbone_and_transform
 from prismatic.models.registry import GLOBAL_REGISTRY, MODEL_REGISTRY
-from prismatic.models.vlms import PrismaticVLM
+from prismatic.models.vlms import PrismaticVLM, PrismaticVLMFlash, PrismaticVLMTTF
 from prismatic.overwatch import initialize_overwatch
 
 from vla import CogACT
@@ -54,6 +54,7 @@ def load(
     hf_token: Optional[str] = None,
     cache_dir: Optional[Union[str, Path]] = None,
     load_for_training: bool = False,
+    baseline: Optional[str] = None,
 ) -> PrismaticVLM:
     """Loads a pretrained PrismaticVLM from either local disk or the HuggingFace Hub."""
     if os.path.isdir(model_id_or_path):
@@ -106,7 +107,13 @@ def load(
 
     # Load VLM using `from_pretrained` (clobbers HF syntax... eventually should reconcile)
     overwatch.info(f"Loading VLM [bold blue]{model_cfg['model_id']}[/] from Checkpoint")
-    vlm = PrismaticVLM.from_pretrained(
+    if baseline is None:
+        vlm_cls = PrismaticVLM
+    elif baseline == "flashvla":
+        vlm_cls = PrismaticVLMFlash
+    elif baseline == "ttf":
+        vlm_cls = PrismaticVLMTTF
+    vlm = vlm_cls.from_pretrained(
         checkpoint_pt,
         model_cfg["model_id"],
         vision_backbone,
@@ -124,6 +131,7 @@ def load_vla(
     cache_dir: Optional[Union[str, Path]] = None,
     load_for_training: bool = False,
     model_type: str = "pretrained",
+    baseline: Optional[str] = None,
     **kwargs,
 ) -> CogACT:
     """Loads a pretrained CogACT from either local disk or the HuggingFace Hub."""
@@ -204,14 +212,14 @@ def load_vla(
     # Load Vision Backbone
     overwatch.info(f"Loading Vision Backbone [bold]{model_cfg.vision_backbone_id}[/]")
     vision_backbone, image_transform = get_vision_backbone_and_transform(
-        model_cfg.vision_backbone_id,
+        model_cfg.vision_backbone_id if baseline != "ttf" else "dinosiglip-vit-so-ttf-224px",
         model_cfg.image_resize_strategy,
     )
 
     # Load LLM Backbone --> note `inference_mode = True` by default when calling `load()`
     overwatch.info(f"Loading Pretrained LLM [bold]{model_cfg.llm_backbone_id}[/] via HF Transformers")
     llm_backbone, tokenizer = get_llm_backbone_and_tokenizer(
-        model_cfg.llm_backbone_id,
+        model_cfg.llm_backbone_id if baseline is None else model_cfg.llm_backbone_id.replace("-pure", '-' + baseline + '-pure'),
         llm_max_length=model_cfg.llm_max_length,
         hf_token=hf_token,
         inference_mode=not load_for_training,
@@ -228,6 +236,7 @@ def load_vla(
         arch_specifier=model_cfg.arch_specifier,
         freeze_weights=not load_for_training,
         norm_stats=norm_stats,
+        baseline=baseline,
         **kwargs,
     )
     # training_cfg['use_cache_gate'] = False
