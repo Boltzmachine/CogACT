@@ -19,24 +19,20 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple, Union, List
+from typing import Optional, Tuple, Union
 
 import draccus
 import torch
 import torch.distributed as dist
 import yaml
-import wandb
 
+from prismatic.conf import VLAConfig, VLARegistry
+from prismatic.models import load, load_vla
 from prismatic.overwatch import initialize_overwatch
+from prismatic.training import VLAMetrics, get_train_strategy
 from prismatic.util import set_global_seed
 from prismatic.vla import get_vla_dataset_and_collator
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
-
-from training import VLAMetrics, get_train_strategy
-from conf import VLAConfig, VLARegistry
-from vla import load, load_vla
-from vla import CogACT
-from vla_modules.utils import postset_model
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -49,19 +45,10 @@ overwatch = initialize_overwatch(__name__)
 @dataclass
 class TrainConfig:
     # fmt: off
-    disentangle: str = "none"
-    with_memory: bool = False
-    static_ratio: Union[float, List[float]] = 0.0
-    invswap_ratio: float = 1.0
-    use_contrastive: bool = False
-    backward_window_size: Union[int, List[int]] = 10
-    use_cache_gate: bool = False
 
-    lora_rank: int = 0
-
-    # VLAConfig (`conf/vla.py`); override with --vla.type `VLARegistry.<VLA>.vla_id`
+    # VLAConfig (`prismatic/conf/vla.py`); override with --vla.type `VLARegistry.<VLA>.vla_id`
     vla: VLAConfig = field(
-        default_factory=VLAConfig.get_choice_class(VLARegistry.EXP_COGACT_OXE_MAGIC_SOUP_PLUS_MINUS.vla_id)
+        default_factory=VLAConfig.get_choice_class(VLARegistry.DINOSIGLIP_224PX_MX_OXE_MAGIC_SOUP_PLUS.vla_id)
     )
 
     # Directory Paths
@@ -71,9 +58,9 @@ class TrainConfig:
     run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
 
     # Resume Run Parameters
-    pretrained_checkpoint: Optional[Union[str, Path]] = None                  # Absolute Path to Checkpoint
+    pretrained_checkpoint: Optional[Path] = None                    # Absolute Path to Checkpoint
     is_resume: bool = True                                          # Whether we are continuing a prior training run
-                                                                    # (only applicable given pretrained checkpoint)
+                                                                    #   (only applicable given pretrained checkpoint)
     resume_step: Optional[int] = None                               # Global Step to Resume (should match checkpoint)
     resume_epoch: Optional[int] = None                              # Epoch to Resume (should match checkpoint)
 
@@ -82,23 +69,15 @@ class TrainConfig:
     run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
     save_interval: int = 2500                                       # Interval for saving checkpoints (in steps)
     image_aug: bool = False                                         # Whether to enable image augmentations
-    seed: int = 42                                                  # Random seed (for reproducibility)
+    seed: int = 7                                                   # Random seed (for reproducibility)
 
     # HF Hub Credentials (for any gated models)
     hf_token: Union[str, Path] = Path(".hf_token")                  # Environment variable or Path to HF Token
 
     # Tracking Parameters
     trackers: Tuple[str, ...] = ("jsonl", "wandb")                  # Trackers to initialize (if W&B, add config!)
-    #trackers: Tuple[str, ...] = ("jsonl",)                         # Trackers to initialize (if W&B, add config!)
-    wandb_project: str = ""                                         # Name of W&B project to log to (use default!)
-    wandb_entity: str = ""                                          # Name of entity to log under
-    repeated_diffusion_steps: int = 8                               # Repeated steps for training action model (a diffusion model)
-    load_all_data_for_training: bool = True                         # Load all training data 
-    future_action_window_size: int = 15                             # Action chunking, predicting future actions + current action
-    past_action_window_size: int = 0                                # Action history window size, not used now, set to be 0 
-    action_model_type: str = 'DiT-B'                                # Action model type, chose from ['DiT-S', 'DiT-B', 'DiT-L']
-    use_ema: bool = False                                           # EMA version of action model
-    action_dim: int = 7                                             # Dimension of action space
+    wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
+    wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
 
     def __post_init__(self) -> None:
         """Lift optimization parameters from `self.vla` for ease of use =>> validate on `expected_world_size`"""
@@ -125,7 +104,7 @@ class TrainConfig:
 
 @draccus.wrap()
 def train(cfg: TrainConfig) -> None:
-    overwatch.info("CogACT-VLA Training :: Warming Up")
+    overwatch.info("OpenVLA Training :: Warming Up")
 
     # Note => Under `torchrun` initializing `overwatch` will automatically set up `torch.distributed`
     torch.cuda.set_device(device_id := overwatch.local_rank())
@@ -156,8 +135,7 @@ def train(cfg: TrainConfig) -> None:
         with open(run_dir / "config.yaml", "r") as f_yaml, open(run_dir / "config.json", "w") as f_json:
             yaml_cfg = yaml.safe_load(f_yaml)
             json.dump(yaml_cfg, f_json, indent=2)
-    
-    dist.barrier()
+
     # Load VLA checkpoint (if resuming from training) or Base VLM otherwise (from `cfg.vla.base_vlm` ID or Path)
     #   =>> Note :: Verifies that all parameters are loaded in FP32 on load!
     overwatch.info(f"Loading Base VLM `{cfg.vla.base_vlm}` from ID/Path")
@@ -167,53 +145,26 @@ def train(cfg: TrainConfig) -> None:
         if cfg.is_resume:
             assert int(re.search("step-(.+?)-", cfg.pretrained_checkpoint.name).group(1)) == cfg.resume_step
             assert int(re.search("epoch-(.+?)-", cfg.pretrained_checkpoint.name).group(1)) == cfg.resume_epoch
-        overwatch.info("Loading VLA Checkpoint")
-        if cfg.use_ema:
-            overwatch.info("Loading EMA of Diffusion")
-        vla = load_vla(cfg.pretrained_checkpoint, 
-                        hf_token=hf_token, 
-                        load_for_training=True, 
-                        action_model_type=cfg.action_model_type, 
-                        action_dim=cfg.action_dim,
-                        future_action_window_size=cfg.future_action_window_size,
-                        past_action_window_size=cfg.past_action_window_size,
-                        use_ema=cfg.use_ema,
-                        use_cache_gate=cfg.use_cache_gate,
-                        static_ratio=cfg.static_ratio,
-                        )
+
+        vlm = load_vla(cfg.pretrained_checkpoint, hf_token=hf_token, load_for_training=True)
 
     else:
         vlm = load(cfg.vla.base_vlm, hf_token=hf_token, load_for_training=True)
-        overwatch.info("Creating VLA from Base VLM")
-        if cfg.use_ema:
-            overwatch.info("Creating EMA for Diffusion")
-        vla = CogACT(vlm, 
-                            action_model_type=cfg.action_model_type,
-                            action_dim=cfg.action_dim,
-                            future_action_window_size=cfg.future_action_window_size,
-                            past_action_window_size=cfg.past_action_window_size,
-                            use_ema=cfg.use_ema,
-                            use_cache_gate=cfg.use_cache_gate
-                            )
-        # del this variable to avoid bugs. The vlm shouldn't be used anymore
-        del vlm
-    # if "disentangle_method" not in vla.vlm.config:
-    postset_model(vla.vlm, cfg)
 
     # [Validate] Model should be in Full Precision!
-    for param in vla.parameters():
+    for param in vlm.parameters():
         assert param.dtype == torch.float32, f"Loaded VLM parameter not in full precision: {param}"
 
     # Determine training "stage" based on frozen vs unfrozen parameters --> supports different fine-tuning schemes!
     if not cfg.vla.freeze_vision_backbone and not cfg.vla.freeze_llm_backbone:
-        stage = "full-finetune"  # Full fine-tuning
+        stage = "vla-full-train"  # Full fine-tuning
     elif cfg.vla.freeze_vision_backbone and not cfg.vla.freeze_llm_backbone:
-        stage = "finetune"  # Frozen vision encoder
-    elif cfg.vla.freeze_vision_backbone and cfg.vla.freeze_llm_backbone:
-        stage = "align"  # Fine-tuning projector
-    elif not cfg.vla.freeze_vision_backbone and cfg.vla.freeze_llm_backbone and cfg.vla.unfreeze_last_llm_layer:
+        stage = "vla-train"  # Frozen vision encoder
+    elif not cfg.vla.freeze_vision_backbone and cfg.vla.freeze_llm_backbone:
+        assert cfg.vla.unfreeze_last_llm_layer, "You should unfreeze at least the last layer of your LLM!"
         stage = "vla-sandwich-train"  # Fine-tuning vision encoder, projector, and LLM last layer
-    elif cfg.vla.freeze_vision_backbone and cfg.vla.freeze_llm_backbone and cfg.vla.unfreeze_last_llm_layer:
+    elif cfg.vla.freeze_vision_backbone and cfg.vla.freeze_llm_backbone:
+        assert cfg.vla.unfreeze_last_llm_layer, "Need to unfreeze at least last LLM layer to train!"
         stage = "vla-last-layer-train"  # Fine-tuning LLM last layer only
     else:
         raise ValueError(
@@ -225,55 +176,37 @@ def train(cfg: TrainConfig) -> None:
 
     # [Explicit] Call to `freeze_backbones` here for clarity =>> will log exactly what is/is not frozen
     overwatch.info(f"Invoking `VLM.freeze_backbones()` for `{vla_id}` => Stage: `{stage}`")
-    vla.freeze_backbones(stage)
-
-    if cfg.lora_rank > 0:
-        overwatch.info(f"Applying LoRA with rank {cfg.lora_rank} to LLM Backbone")
-        from peft import LoraConfig, get_peft_model
-        peft_config = LoraConfig(
-            task_type="none", #TaskType.CAUSAL_LM,
-            target_modules=['qkv', 'fc1', 'fc2', 'q_proj', 'k_proj', 'v_proj', 'o_proj', 'up_proj', 'down_proj', 'gate_proj'], # modify here for different LLM architectures
-            modules_to_save=['vlm.projector', 'cache_gate'], # make sure projector is saved
-            r=cfg.lora_rank,
-            lora_alpha=32,
-            lora_dropout=0.1,
-            init_lora_weights="gaussian",
-        )
-        vla.vlm = get_peft_model(vla.vlm, peft_config)
+    vlm.freeze_backbones(stage)
 
     # Print number of total/trainable model parameters
-    num_params = sum(p.numel() for p in vla.parameters())
-    num_trainable_params = sum(p.numel() for p in vla.parameters() if p.requires_grad)
+    num_params = sum(p.numel() for p in vlm.parameters())
+    num_trainable_params = sum(p.numel() for p in vlm.parameters() if p.requires_grad)
     overwatch.info(
         f"# Parameters (in millions): {num_params / 10**6:.3f} Total, {num_trainable_params / 10**6:.3f} Trainable"
     )
 
+    # Get VLA Dataset & Collator
     overwatch.info(f"Creating VLA Open-X Dataset with Mixture `{cfg.vla.data_mix}`")
-    vla_dataset, _, collator = get_vla_dataset_and_collator(
+    vla_dataset, action_tokenizer, collator = get_vla_dataset_and_collator(
         cfg.data_root_dir,
         cfg.vla.data_mix,
-        image_transform=vla.vision_backbone.get_image_transform(),
-        tokenizer=vla.llm_backbone.get_tokenizer(),
-        prompt_builder_fn=vla.llm_backbone.prompt_builder_fn,
-        default_image_resolution=vla.vision_backbone.default_image_resolution,
+        image_transform=vlm.vision_backbone.get_image_transform(),
+        tokenizer=vlm.llm_backbone.get_tokenizer(),
+        prompt_builder_fn=vlm.llm_backbone.prompt_builder_fn,
+        default_image_resolution=vlm.vision_backbone.default_image_resolution,
         shuffle_buffer_size=cfg.vla.shuffle_buffer_size,
         image_aug=cfg.image_aug,
-        load_all_data_for_training=cfg.load_all_data_for_training,
-        future_action_window_size=cfg.future_action_window_size,
-        past_action_window_size=cfg.past_action_window_size,
-        backward_observation_window_size=cfg.backward_window_size,
     )
 
     # Save dataset statistics for de-normalization at inference time
     if overwatch.is_rank_zero():
         save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)
-    
-    dist.barrier()
+
     # Create Train Strategy
     overwatch.info(f"Initializing Train Strategy `{cfg.train_strategy}`")
     train_strategy = get_train_strategy(
         train_strategy=cfg.train_strategy,
-        vlm=vla,
+        vlm=vlm,
         device_id=device_id,
         stage=stage,
         epochs=cfg.epochs,
@@ -291,8 +224,6 @@ def train(cfg: TrainConfig) -> None:
         worker_init_fn=worker_init_fn,
     )
     train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(vla_dataset))
-    if cfg.pretrained_checkpoint is not None and cfg.is_resume:
-        train_strategy.load_optimizer_and_scheduler(cfg.pretrained_checkpoint)
 
     # Create Metrics =>> Handles on the fly tracking, logging to specified trackers (e.g., JSONL, Weights & Biases)
     overwatch.info(f"Creating Metrics with Active Trackers => `{cfg.trackers}`")
@@ -312,9 +243,9 @@ def train(cfg: TrainConfig) -> None:
     train_strategy.run_vla_training(
         vla_dataset,
         collator,
+        action_tokenizer,
         metrics,
         save_interval=cfg.save_interval,
-        action_model=True,
     )
 
     # Finalize
